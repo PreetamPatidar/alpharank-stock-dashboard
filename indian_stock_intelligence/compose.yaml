@@ -1,0 +1,12 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    environment:
+      STOCK_DATA_DIR: /app/data
+    volumes:
+      - stock_data:/app/data
+volumes:
+  stock_data:
