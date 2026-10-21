@@ -29,6 +29,7 @@ from data_loader import (
     load_master_nse_directory,
     get_available_watchlists,
     format_ticker_symbol,
+    clear_disk_cache,
 )
 from charts import (
     create_horizontal_ranking_chart,
@@ -290,7 +291,10 @@ with col_btn1:
     btn_fetch = st.button("🚀 Analyze & Rank", type="primary", use_container_width=True)
 with col_btn2:
     if st.button("🔄 Refresh Live", use_container_width=True, help="Bypass local cache and fetch fresh live quotes"):
-        st.cache_data.clear()
+        clear_disk_cache(final_tickers)
+        if "metrics_df" in st.session_state:
+            del st.session_state["metrics_df"]
+        st.session_state["force_refresh"] = True
         st.rerun()
 
 st.sidebar.markdown("---")
@@ -321,24 +325,35 @@ if not final_tickers:
     st.stop()
 
 
-# FETCH & PROCESS DATA
-progress_placeholder = st.empty()
-status_placeholder = st.empty()
+# FETCH & PROCESS DATA (Cached in session_state to prevent re-fetching on tab clicks)
+current_batch_key = f"{exchange_code}_{selection_mode}_{'|'.join(sorted(final_tickers))}"
+is_new_tickers = st.session_state.get("last_batch_key") != current_batch_key
+force_refresh = st.session_state.pop("force_refresh", False)
 
-def update_progress(done, total):
-    progress_placeholder.progress(done / total)
-    status_placeholder.caption(f"⚡ Fetching fundamentals & moving averages: {done}/{total} stocks completed...")
+if btn_fetch or is_new_tickers or force_refresh or "metrics_df" not in st.session_state:
+    progress_placeholder = st.empty()
+    status_placeholder = st.empty()
 
-with st.spinner(f"Evaluating {len(final_tickers)} stocks across 4 quantitative factors..."):
-    metrics_df, _, failed_tickers = fetch_batch_data(
-        final_tickers,
-        max_workers=10,
-        progress_callback=update_progress,
-        use_cache=True
-    )
+    def update_progress(done, total):
+        progress_placeholder.progress(done / total)
+        status_placeholder.caption(f"⚡ Fetching fundamentals & moving averages: {done}/{total} stocks completed...")
 
-progress_placeholder.empty()
-status_placeholder.empty()
+    with st.spinner(f"Evaluating {len(final_tickers)} stocks across 4 quantitative factors..."):
+        metrics_df, _, failed_tickers = fetch_batch_data(
+            final_tickers,
+            max_workers=10,
+            progress_callback=update_progress,
+            use_cache=not force_refresh
+        )
+
+    progress_placeholder.empty()
+    status_placeholder.empty()
+    st.session_state["metrics_df"] = metrics_df
+    st.session_state["failed_tickers"] = failed_tickers
+    st.session_state["last_batch_key"] = current_batch_key
+else:
+    metrics_df = st.session_state["metrics_df"]
+    failed_tickers = st.session_state.get("failed_tickers", [])
 
 if failed_tickers:
     st.warning(f"⚠️ Note: {len(failed_tickers)} tickers could not be retrieved: {', '.join(failed_tickers[:8])}{'...' if len(failed_tickers)>8 else ''}")
@@ -347,8 +362,8 @@ if metrics_df.empty:
     st.error("No valid stock data could be fetched. Please verify the selected tickers.")
     st.stop()
 
-# Compute Rankings via Scoring Engine
-ranked_df = calculate_multi_factor_rankings(metrics_df)
+# Compute Rankings via Scoring Engine using active user weights
+ranked_df = calculate_multi_factor_rankings(metrics_df, active_weights)
 
 
 # TOP METRIC SUMMARY CARDS
@@ -449,33 +464,62 @@ with tab_rankings:
     filtered_ranked_df = ranked_df[ranked_df["rating"].isin(rating_filter)].copy() if rating_filter else ranked_df.copy()
     display_df = filtered_ranked_df.copy()
     
-    # Formatted display columns
-    display_df["ROE (%)"] = display_df["returnOnEquity"].apply(
-        lambda x: f"{x * 100:.1f}%" if pd.notna(x) else "N/A"
-    )
-    display_df["D/E Ratio"] = display_df["debtToEquity"].apply(
-        lambda x: f"{x / 100:.2f}x" if pd.notna(x) and x > 10 else (f"{x:.2f}x" if pd.notna(x) else "N/A")
-    )
-    display_df["Trailing P/E"] = display_df["trailingPE"].apply(
-        lambda x: f"{x:.1f}x" if pd.notna(x) and x > 0 else ("Loss" if pd.notna(x) else "N/A")
-    )
-    display_df["Current Price"] = display_df["currentPrice"].apply(lambda x: f"{curr_symbol} {x:,.2f}")
-    display_df["50 SMA"] = display_df["sma50"].apply(lambda x: f"{curr_symbol} {x:,.2f}" if pd.notna(x) else "N/A")
-    display_df["200 SMA"] = display_df["sma200"].apply(lambda x: f"{curr_symbol} {x:,.2f}" if pd.notna(x) else "N/A")
+    # Formatted display columns with resilient null handling
+    def _safe_roe(x):
+        try:
+            return f"{float(x) * 100:.1f}%" if pd.notna(x) else "N/A"
+        except Exception:
+            return "N/A"
+
+    def _safe_de(x):
+        try:
+            if pd.isna(x):
+                return "N/A"
+            v = float(x)
+            return f"{v / 100.0:.2f}x" if v > 10.0 else f"{v:.2f}x"
+        except Exception:
+            return "N/A"
+
+    def _safe_pe(x):
+        try:
+            if pd.isna(x):
+                return "N/A"
+            v = float(x)
+            return f"{v:.1f}x" if v > 0 else "Loss"
+        except Exception:
+            return "N/A"
+
+    def _safe_currency(x):
+        try:
+            return f"{curr_symbol} {float(x):,.2f}" if pd.notna(x) else "N/A"
+        except Exception:
+            return "N/A"
+
+    display_df["ROE (%)"] = display_df["returnOnEquity"].apply(_safe_roe)
+    display_df["D/E Ratio"] = display_df["debtToEquity"].apply(_safe_de)
+    display_df["Trailing P/E"] = display_df["trailingPE"].apply(_safe_pe)
+    display_df["Current Price"] = display_df["currentPrice"].apply(_safe_currency)
+    display_df["50 SMA"] = display_df["sma50"].apply(_safe_currency)
+    display_df["200 SMA"] = display_df["sma200"].apply(_safe_currency)
     
     # Momentum tag
     def get_mom_tag(row):
-        p, s50, s200 = row["currentPrice"], row["sma50"], row["sma200"]
-        if pd.isna(s50) or pd.isna(s200):
+        try:
+            p = float(row["currentPrice"]) if pd.notna(row["currentPrice"]) else None
+            s50 = float(row["sma50"]) if pd.notna(row["sma50"]) else None
+            s200 = float(row["sma200"]) if pd.notna(row["sma200"]) else None
+            if p is None or s50 is None or s200 is None:
+                return "N/A"
+            if p > s50 > s200:
+                return "🟢 Bullish (P>50>200)"
+            elif p > s50 and p > s200:
+                return "🟡 Above MAs"
+            elif s50 > s200:
+                return "🟡 Golden Cross (Pullback)"
+            else:
+                return "🔴 Bearish Trend"
+        except Exception:
             return "N/A"
-        if p > s50 > s200:
-            return "🟢 Bullish (P>50>200)"
-        elif p > s50 and p > s200:
-            return "🟡 Above MAs"
-        elif s50 > s200:
-            return "🟡 Golden Cross (Pullback)"
-        else:
-            return "🔴 Bearish Trend"
             
     display_df["Momentum Alignment"] = display_df.apply(get_mom_tag, axis=1)
 

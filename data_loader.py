@@ -8,6 +8,7 @@ and pre-built indices (Nifty 50, Nifty 500, Sensex, Sectoral, and full NSE Maste
 import os
 import json
 import time
+import threading
 from typing import Dict, List, Tuple, Any, Optional, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import yfinance as yf
@@ -18,6 +19,20 @@ import numpy as np
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "data")
 CACHE_FILE = os.path.join(CACHE_DIR, "metrics_cache.json")
 CACHE_TTL_SECONDS = 12 * 3600  # 12 hours cache
+_cache_lock = threading.Lock()
+
+
+def _clean_float(val: Any) -> Optional[float]:
+    """Sanitizes any float value, returning None if NaN, Inf, or invalid."""
+    if val is None or pd.isna(val):
+        return None
+    try:
+        f = float(val)
+        if np.isnan(f) or np.isinf(f):
+            return None
+        return f
+    except (ValueError, TypeError):
+        return None
 
 
 # SENSEX 30 constituents
@@ -107,24 +122,62 @@ WATCHLISTS = get_available_watchlists("NSE")
 
 
 def _read_disk_cache() -> Dict[str, Any]:
-    """Reads persistent cache from disk."""
-    if os.path.exists(CACHE_FILE):
-        try:
-            with open(CACHE_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+    """Reads persistent cache from disk thread-safely."""
+    with _cache_lock:
+        if os.path.exists(CACHE_FILE):
+            try:
+                with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                return {}
+        return {}
 
 
 def _write_disk_cache(cache_data: Dict[str, Any]):
-    """Writes persistent cache to disk safely."""
-    try:
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        with open(CACHE_FILE, "w") as f:
-            json.dump(cache_data, f)
-    except Exception as e:
-        print(f"Cache write error: {e}")
+    """Writes persistent cache to disk safely using atomic rename."""
+    with _cache_lock:
+        try:
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            temp_file = CACHE_FILE + ".tmp"
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(cache_data, f, ensure_ascii=False)
+            if os.path.exists(CACHE_FILE):
+                os.replace(temp_file, CACHE_FILE)
+            else:
+                os.rename(temp_file, CACHE_FILE)
+        except Exception as e:
+            print(f"Cache write error: {e}")
+
+
+def clear_disk_cache(tickers: Optional[List[str]] = None):
+    """Purges disk cache for specified tickers, or all if None."""
+    with _cache_lock:
+        if tickers is None:
+            if os.path.exists(CACHE_FILE):
+                try:
+                    os.remove(CACHE_FILE)
+                except Exception:
+                    pass
+        else:
+            cache = {}
+            if os.path.exists(CACHE_FILE):
+                try:
+                    with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                        cache = json.load(f)
+                except Exception:
+                    cache = {}
+            for t in tickers:
+                cache.pop(t.strip().upper(), None)
+            try:
+                temp_file = CACHE_FILE + ".tmp"
+                with open(temp_file, "w", encoding="utf-8") as f:
+                    json.dump(cache, f, ensure_ascii=False)
+                if os.path.exists(CACHE_FILE):
+                    os.replace(temp_file, CACHE_FILE)
+                else:
+                    os.rename(temp_file, CACHE_FILE)
+            except Exception:
+                pass
 
 
 def format_ticker_symbol(symbol: str, default_exchange: str = "NSE") -> str:
@@ -149,14 +202,13 @@ def format_ticker_symbol(symbol: str, default_exchange: str = "NSE") -> str:
 
 def fetch_single_ticker_data(ticker_symbol: str, use_cache: bool = True) -> Optional[Dict[str, Any]]:
     """
-    Fetches real-time fundamentals and SMA data for a single stock ticker.
-    Utilizes local disk caching for fast repeat loads.
+    Fetches fundamentals, valuation, and SMA metrics for a single stock ticker.
+    Utilizes local disk caching and fast_info fallback for maximum reliability.
     """
     clean_sym = ticker_symbol.strip().upper()
     if not clean_sym:
         return None
 
-    # Check local disk cache
     now = time.time()
     if use_cache:
         cache = _read_disk_cache()
@@ -165,101 +217,118 @@ def fetch_single_ticker_data(ticker_symbol: str, use_cache: bool = True) -> Opti
             cached_time = cached_item.get("_cached_at", 0)
             if now - cached_time < CACHE_TTL_SECONDS:
                 data = cached_item.get("data", {})
-                if data:
+                if data and data.get("currentPrice") is not None:
                     return data
 
     try:
         t = yf.Ticker(clean_sym)
-        info = t.info or {}
         
-        # 1-year historical prices for 50 & 200 SMA calculation and charting
-        hist = t.history(period="1y")
+        # 1. Fetch info with graceful fallback
+        info = {}
+        try:
+            info = t.info or {}
+        except Exception:
+            info = {}
+            
+        fast_info = getattr(t, "fast_info", None)
         
-        if hist.empty or len(hist) < 20:
-            if not info or ("regularMarketPrice" not in info and "currentPrice" not in info):
-                return None
-
-        # Price retrieval
-        current_price = (
+        # 2. Current Price (check info then fast_info)
+        current_price = _clean_float(
             info.get("currentPrice") or
             info.get("regularMarketPrice") or
-            (hist["Close"].iloc[-1] if not hist.empty else None)
+            getattr(fast_info, "last_price", None) or
+            getattr(fast_info, "previous_close", None)
         )
-        if current_price is None or pd.isna(current_price):
+        
+        # 3. 50 & 200 SMA (check info / fast_info directly to avoid slow 1y download)
+        sma50_calc = _clean_float(
+            info.get("fiftyDayAverage") or
+            getattr(fast_info, "fifty_day_average", None)
+        )
+        sma200_calc = _clean_float(
+            info.get("twoHundredDayAverage") or
+            getattr(fast_info, "two_hundred_day_average", None)
+        )
+        
+        # Only fetch 1y history if price or moving averages could not be found
+        if current_price is None or sma50_calc is None or sma200_calc is None:
+            try:
+                hist = t.history(period="1y")
+                if not hist.empty and "Close" in hist.columns:
+                    if current_price is None and len(hist) > 0:
+                        current_price = _clean_float(hist["Close"].iloc[-1])
+                    if sma50_calc is None and len(hist) >= 20:
+                        sma50_calc = _clean_float(hist["Close"].rolling(window=min(50, len(hist))).mean().iloc[-1])
+                    if sma200_calc is None and len(hist) >= 50:
+                        sma200_calc = _clean_float(hist["Close"].rolling(window=min(200, len(hist))).mean().iloc[-1])
+            except Exception:
+                pass
+
+        if current_price is None:
             return None
 
-        # Moving Averages calculation
-        if len(hist) >= 50:
-            sma50_calc = float(hist["Close"].rolling(window=50).mean().iloc[-1])
-        else:
-            sma50_calc = info.get("fiftyDayAverage")
-
-        if len(hist) >= 200:
-            sma200_calc = float(hist["Close"].rolling(window=200).mean().iloc[-1])
-        else:
-            sma200_calc = info.get("twoHundredDayAverage") or (float(hist["Close"].mean()) if len(hist) >= 50 else sma50_calc)
-
-        # Fundamentals
-        roe = info.get("returnOnEquity")
-        if roe is not None and not pd.isna(roe):
-            roe = float(roe)
-        else:
-            # Fallback derivation for Indian equities (often omitted from top-level info)
-            net_income = info.get("netIncomeToCommon")
-            book_val = info.get("bookValue")
-            shares = info.get("sharesOutstanding")
-            de_ratio = info.get("debtToEquity")
-            total_debt = info.get("totalDebt")
+        # 4. Return on Equity (ROE)
+        roe = _clean_float(info.get("returnOnEquity"))
+        if roe is None:
+            net_income = _clean_float(info.get("netIncomeToCommon"))
+            book_val = _clean_float(info.get("bookValue"))
+            shares = _clean_float(info.get("sharesOutstanding"))
+            total_equity = _clean_float(info.get("totalStockholderEquity"))
             
-            if net_income and book_val and shares and (book_val * shares) > 0:
-                equity = float(book_val) * float(shares)
-                roe = float(net_income) / equity
-            elif net_income and total_debt and de_ratio and de_ratio > 0:
-                # de_ratio is totalDebt / equity * 100
-                equity = float(total_debt) / (float(de_ratio) / 100.0)
-                roe = float(net_income) / equity
-            else:
-                roe = None
+            if total_equity is None and book_val and shares and (book_val * shares) > 0:
+                total_equity = book_val * shares
+                
+            if net_income is not None and total_equity and total_equity > 0:
+                roe = net_income / total_equity
 
-        debt_to_equity = info.get("debtToEquity")
-        if debt_to_equity is not None and not pd.isna(debt_to_equity):
-            debt_to_equity = float(debt_to_equity)
-        else:
-            total_debt = info.get("totalDebt")
-            stockholder_equity = info.get("totalStockholderEquity") or info.get("bookValue")
+        # 5. Debt to Equity (D/E)
+        debt_to_equity = _clean_float(info.get("debtToEquity"))
+        if debt_to_equity is None:
+            total_debt = _clean_float(info.get("totalDebt"))
+            total_equity = _clean_float(info.get("totalStockholderEquity"))
+            book_val = _clean_float(info.get("bookValue"))
+            shares = _clean_float(info.get("sharesOutstanding"))
+            
+            # Correct total equity calculation: per-share bookValue * sharesOutstanding
+            if total_equity is None and book_val and shares and (book_val * shares) > 0:
+                total_equity = book_val * shares
+                
             if total_debt == 0 or total_debt is None:
                 debt_to_equity = 0.0
-            elif stockholder_equity and stockholder_equity > 0:
-                debt_to_equity = (total_debt / stockholder_equity) * 100.0
+            elif total_equity and total_equity > 0:
+                debt_to_equity = (total_debt / total_equity) * 100.0
             else:
                 debt_to_equity = None
 
-        trailing_pe = info.get("trailingPE")
-        if trailing_pe is None or pd.isna(trailing_pe):
-            trailing_pe = info.get("forwardPE")
-        else:
-            trailing_pe = float(trailing_pe)
+        # 6. Trailing P/E
+        trailing_pe = _clean_float(info.get("trailingPE"))
+        if trailing_pe is None:
+            trailing_pe = _clean_float(info.get("forwardPE"))
+        if trailing_pe is None:
+            eps = _clean_float(info.get("trailingEps") or info.get("forwardEps"))
+            if eps and eps > 0 and current_price and current_price > 0:
+                trailing_pe = current_price / eps
 
         company_name = info.get("shortName") or info.get("longName") or clean_sym
         sector = info.get("sector") or info.get("industry") or "Diversified"
-        market_cap = info.get("marketCap") or 0
-        currency = info.get("currency") or ("INR" if (".NS" in clean_sym or ".BO" in clean_sym) else "USD")
+        market_cap = _clean_float(info.get("marketCap") or getattr(fast_info, "market_cap", None)) or 0
+        currency = info.get("currency") or getattr(fast_info, "currency", None) or ("INR" if (".NS" in clean_sym or ".BO" in clean_sym) else "USD")
 
         result = {
             "ticker": clean_sym,
-            "name": company_name,
-            "sector": sector,
-            "currency": currency,
-            "marketCap": market_cap,
-            "currentPrice": round(float(current_price), 2),
-            "returnOnEquity": roe,
-            "debtToEquity": debt_to_equity,
-            "trailingPE": round(float(trailing_pe), 2) if trailing_pe is not None else None,
-            "sma50": round(float(sma50_calc), 2) if sma50_calc is not None else None,
-            "sma200": round(float(sma200_calc), 2) if sma200_calc is not None else None,
+            "name": str(company_name),
+            "sector": str(sector),
+            "currency": str(currency),
+            "marketCap": round(market_cap, 2),
+            "currentPrice": round(current_price, 2),
+            "returnOnEquity": round(roe, 4) if roe is not None else None,
+            "debtToEquity": round(debt_to_equity, 2) if debt_to_equity is not None else None,
+            "trailingPE": round(trailing_pe, 2) if trailing_pe is not None else None,
+            "sma50": round(sma50_calc, 2) if sma50_calc is not None else None,
+            "sma200": round(sma200_calc, 2) if sma200_calc is not None else None,
         }
 
-        # Save to disk cache
+        # Save to disk cache thread-safely
         if use_cache:
             cache = _read_disk_cache()
             cache[clean_sym] = {"_cached_at": now, "data": result}
@@ -323,7 +392,7 @@ def fetch_batch_data(
                 
             try:
                 item = future.result()
-                if item is not None:
+                if item is not None and isinstance(item, dict) and item.get("currentPrice") is not None:
                     data_list.append(item)
                 else:
                     failed_tickers.append(ticker)

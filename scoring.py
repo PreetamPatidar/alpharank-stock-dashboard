@@ -7,7 +7,7 @@ Calculates normalized scores (0-100) across 4 key financial dimensions:
 4. Momentum (10%): Price vs 50-day and 200-day SMA. Maximum when Price > 50 SMA > 200 SMA.
 """
 
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 import numpy as np
 import pandas as pd
 
@@ -72,7 +72,7 @@ def calculate_financial_risk_score(de_series: pd.Series) -> pd.Series:
     
     for idx, val in de_series.items():
         if pd.isna(val):
-            scores[idx] = 0.0
+            scores[idx] = 50.0  # Neutral baseline for companies without reported debt
             continue
             
         # yfinance often returns debtToEquity as e.g. 150 (meaning 1.5x) or 1.5
@@ -97,7 +97,7 @@ def calculate_valuation_score(pe_series: pd.Series) -> pd.Series:
     Valuation (25% Weight):
     Compare the stock's P/E to the median P/E of the imported batch.
     A lower relative P/E score ranks higher.
-    Unprofitable stocks (P/E <= 0 or NaN) receive 0 points.
+    Unprofitable stocks (P/E <= 0) receive 0 points; missing receive neutral 30.
     """
     scores = pd.Series(index=pe_series.index, dtype=float)
     
@@ -112,8 +112,10 @@ def calculate_valuation_score(pe_series: pd.Series) -> pd.Series:
     median_pe = positive_pes.median()
     
     for idx, val in pe_series.items():
-        if pd.isna(val) or val <= 0:
-            scores[idx] = 0.0
+        if pd.isna(val):
+            scores[idx] = 30.0  # Neutral-conservative baseline for missing P/E
+        elif val <= 0:
+            scores[idx] = 0.0   # Negative P/E (Loss-making) penalized
         else:
             ratio = val / median_pe
             if ratio <= 1.0:
@@ -179,7 +181,10 @@ def calculate_momentum_score(
     return scores
 
 
-def calculate_multi_factor_rankings(df: pd.DataFrame) -> pd.DataFrame:
+def calculate_multi_factor_rankings(
+    df: pd.DataFrame,
+    custom_weights: Optional[Dict[str, float]] = None
+) -> pd.DataFrame:
     """
     Calculates sub-scores and overall normalized Investment Score (0-100)
     for a dataframe containing ticker metrics.
@@ -195,6 +200,13 @@ def calculate_multi_factor_rankings(df: pd.DataFrame) -> pd.DataFrame:
     """
     result = df.copy()
     
+    # Resolve active weights normalized to 1.0
+    w = WEIGHTS.copy()
+    if custom_weights:
+        tot = sum(custom_weights.values())
+        if tot > 0:
+            w = {k: v / tot for k, v in custom_weights.items()}
+            
     # 1. Efficiency Sub-Score
     result["efficiency_score"] = calculate_efficiency_score(result["returnOnEquity"])
     
@@ -213,10 +225,10 @@ def calculate_multi_factor_rankings(df: pd.DataFrame) -> pd.DataFrame:
     
     # 5. Composite Investment Score (0 to 100)
     result["investment_score"] = (
-        result["efficiency_score"] * WEIGHTS["efficiency"] +
-        result["financial_risk_score"] * WEIGHTS["financial_risk"] +
-        result["valuation_score"] * WEIGHTS["valuation"] +
-        result["momentum_score"] * WEIGHTS["momentum"]
+        result["efficiency_score"] * w.get("efficiency", 0.35) +
+        result["financial_risk_score"] * w.get("financial_risk", 0.30) +
+        result["valuation_score"] * w.get("valuation", 0.25) +
+        result["momentum_score"] * w.get("momentum", 0.10)
     ).round(1)
     
     # Rank assignment
